@@ -14,7 +14,7 @@
   ]).
 
 % Internal API
--export([do_work/4, execute_transaction/5]).
+-export([do_work/4]).
 
 -define(SERVER, ?MODULE).
 -define(WORKER_TIMEOUT, 1000).
@@ -66,14 +66,4 @@ start(Port, InetFamily) ->
   end.
 
 do_work(Socket, Host, Port, Bin) ->
-  poolboy:transaction(udp_worker_pool, worker_function(Socket, Host, Port, Bin), ?WORKER_TIMEOUT).
-
-worker_function(Socket, Host, Port, Bin) ->
-  fun(Worker) ->
-    erldns_metrics:measure(Host, ?MODULE, execute_transaction, [Worker, Socket, Host, Port, Bin])
-  end.
-
-execute_transaction(Worker, Socket, Host, Port, Bin) ->
-  lager:debug("Processing UDP with worker ~p ~p ~p", [Socket, Host, Port]),
-  gen_server:call(Worker, {udp_query, Socket, Host, Port, Bin}),
-  lager:debug("Completed UDP with worker ~p ~p ~p", [Socket, Host, Port]).
+  spawn(erldns_worker, handle_udp_dns_query, [Socket, Host, Port, Bin]).
