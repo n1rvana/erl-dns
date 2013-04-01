@@ -39,12 +39,13 @@ code_change(_OldVsn, State, _Extra) ->
 receive_next(Socket) ->
   case gen_udp:recv(Socket, 0) of
     {ok, {Address, Port, Packet}} ->
-      handle_query(Socket, Address, Port, Packet),
-      receive_next(Socket);
+      handle_query(Socket, Address, Port, Packet);
+    {error, ealready} ->
+      ok;
     {error, Reason} ->
-      %lager:error("Error reading packet: ~p", [Reason]),
-      receive_next(Socket)
-  end.
+      lager:error("Error reading packet: ~p", [Reason])
+  end,
+  receive_next(Socket).
 
 %% Handle DNS query that comes in over UDP
 handle_query(Socket, Host, Port, Bin) ->
