@@ -14,7 +14,7 @@
   ]).
 
 -define(SERVER, ?MODULE).
--define(NUM_WORKERS, 10).
+-define(NUM_WORKERS, 2).
 
 -record(state, {port, socket, workers}).
 
