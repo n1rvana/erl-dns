@@ -7,6 +7,9 @@
 -export([start_link/3, listen/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
+%% Internal API
+-export([handle_query/4]).
+
 -record(state, {socket}).
 
 -define(MAX_PACKET_SIZE, 512).
@@ -39,7 +42,7 @@ code_change(_OldVsn, State, _Extra) ->
 receive_next(Socket) ->
   case gen_udp:recv(Socket, 0) of
     {ok, {Address, Port, Packet}} ->
-      handle_query(Socket, Address, Port, Packet);
+      erldns_metrics:measure(Address, ?MODULE, handle_query, [Socket, Address, Port, Packet]);
     {error, ealready} ->
       ok;
     {error, Reason} ->
