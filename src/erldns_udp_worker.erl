@@ -37,7 +37,7 @@ code_change(_OldVsn, State, _Extra) ->
   {ok, State}.
 
 receive_next(Socket) ->
-  case gen_udp:recv(Socket, 0, 1000) of
+  case gen_udp:recv(Socket, 0) of
     {ok, {Address, Port, Packet}} ->
       handle_query(Socket, Address, Port, Packet);
     {error, ealready} ->
