@@ -54,9 +54,7 @@ Here are some queries to try:
 
 ## Performance
 
-Currently this system is able to handle around 1k QPS of real traffic.
-
-The goal is 10k QPS.
+In our environment (DNSimple) we are seeing 30 to 65 µs handoff times to retreive a packet from the UDP port and give it to a worker for processing. Your performance may very, but given those measurements erl-dns is capable of handling between 15k and 30k questions per second. Please note: You may need to configure the number of workers available to handle traffic at higher volumes.
 
 ## Design
 
@@ -83,3 +81,13 @@ erldns_zone_cache:put_zone({
     }
   ]}).
 ```
+
+## Metrics
+
+Folsom is used to gather runtime metrics and statistics.
+
+There is an HTTP API for querying metric data available at https://github.com/aetrion/erldns-metrics
+
+## Admin
+
+There is a administrative API for querying the current zone cache and for basic control. You can find it in https://github.com/aetrion/erldns-admin

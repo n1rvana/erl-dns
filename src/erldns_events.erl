@@ -12,17 +12,27 @@
 %% ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 %% OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-%% @doc Sample custom zone parser.
--module(sample_custom_zone_parser).
+%% @doc Public API for erldns event handler registration and notification.
+-module(erldns_events).
 
--include_lib("dns/include/dns.hrl").
--include("erldns.hrl").
+-export([start_link/0, notify/1, add_handler/1, add_handler/2]).
 
--export([json_record_to_erlang/1]).
+%% @doc Start the event process.
+-spec start_link() -> any().
+start_link() ->
+  gen_event:start_link({local, ?MODULE}).
 
--define(DNS_TYPE_SAMPLE, 40000).
+%% @doc Fire an event.
+-spec notify(any()) -> any().
+notify(Event) ->
+  gen_event:notify(?MODULE, Event).
 
-json_record_to_erlang([Name, <<"SAMPLE">>, Ttl, Data, _Context]) ->
-  #dns_rr{name = Name, type = ?DNS_TYPE_SAMPLE, data = proplists:get_value(<<"dname">>, Data), ttl = Ttl};
+%% @doc Add an event handler.
+-spec add_handler(module()) -> any().
+add_handler(Module) ->
+  add_handler(Module, []).
 
-json_record_to_erlang(_) -> {}.
+%% @doc Add an event handler with arguments.
+-spec add_handler(module(), [term()]) -> any().
+add_handler(Module, Args) ->
+  gen_event:add_handler(?MODULE, Module, Args).

@@ -1,6 +1,21 @@
+%% Copyright (c) 2012-2013, Aetrion LLC
+%%
+%% Permission to use, copy, modify, and/or distribute this software for any
+%% purpose with or without fee is hereby granted, provided that the above
+%% copyright notice and this permission notice appear in all copies.
+%%
+%% THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+%% WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+%% MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+%% ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+%% WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+%% ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+%% OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+%% @doc Worker module that processes a single DNS packet.
 -module(erldns_worker).
 
--include("dns.hrl").
+-include_lib("dns/include/dns.hrl").
 
 -behaviour(gen_server).
 -behaviour(poolboy_worker).
@@ -11,6 +26,8 @@
 -record(state, {}).
 
 -define(MAX_PACKET_SIZE, 512).
+-define(REDIRECT_TO_LOOPBACK, false).
+-define(LOOPBACK_DEST, {127, 0, 0, 10}).
 
 start_link(Args) ->
   gen_server:start_link(?MODULE, Args, []).
@@ -35,36 +52,46 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
   {ok, State}.
 
-  %% Handle DNS query that comes in over TCP
-handle_tcp_dns_query(Socket, Packet) ->
-  %% TODO: measure 
-  <<_Len:16, Bin/binary>> = Packet,
+%% @doc Handle DNS query that comes in over TCP
+-spec handle_tcp_dns_query(gen_tcp:socket(), iodata())  -> ok.
+handle_tcp_dns_query(Socket, <<_Len:16, Bin/binary>>) ->
   {ok, {Address, _Port}} = inet:peername(Socket),
+  erldns_events:notify({start_tcp, [{host, Address}]}),
   case Bin of
     <<>> -> ok;
     _ ->
       case dns:decode_message(Bin) of
-        {truncated, _} -> 
-          %lager:info("received bad request from ~p", [Address]);
+        {truncated, _, _} ->
+          lager:info("received truncated request from ~p", [Address]),
+          ok;
+        {trailing_garbage, DecodedMessage, _} ->
+          handle_decoded_tcp_message(DecodedMessage, Socket, Address);
+        {_Error, _, _} ->
           ok;
         DecodedMessage ->
-          Response = erldns_metrics:measure(tcp, erldns_handler, handle, [DecodedMessage, Address]),
-          case erldns_encoder:encode_message(Response) of
-            {false, EncodedMessage} ->
-              send_tcp_message(Socket, EncodedMessage);
-            {true, EncodedMessage, Message} when is_record(Message, dns_message) ->
-              %lager:debug("Leftover: ~p", [Message]),
-              send_tcp_message(Socket, EncodedMessage);
-            {false, EncodedMessage, _TsigMac} ->
-              %lager:debug("TSIG mac: ~p", [TsigMac]),
-              send_tcp_message(Socket, EncodedMessage);
-            {true, EncodedMessage, _TsigMac, _Message} ->
-              %lager:debug("TSIG mac: ~p; Leftover: ~p", [TsigMac, Message]),
-              send_tcp_message(Socket, EncodedMessage)
-          end
+          handle_decoded_tcp_message(DecodedMessage, Socket, Address)
       end
   end,
+  erldns_events:notify({end_tcp, [{host, Address}]}),
+  gen_tcp:close(Socket);
+handle_tcp_dns_query(Socket, BadPacket) ->
+  lager:error("Received bad packet ~p", BadPacket),
   gen_tcp:close(Socket).
+
+handle_decoded_tcp_message(DecodedMessage, Socket, Address) ->
+  erldns_events:notify({start_handle, tcp, [{host, Address}]}),
+  Response = erldns_handler:handle(DecodedMessage, {tcp, Address}),
+  erldns_events:notify({end_handle, tcp, [{host, Address}]}),
+  case erldns_encoder:encode_message(Response) of
+    {false, EncodedMessage} ->
+      send_tcp_message(Socket, EncodedMessage);
+    {true, EncodedMessage, Message} when is_record(Message, dns_message) ->
+      send_tcp_message(Socket, EncodedMessage);
+    {false, EncodedMessage, _TsigMac} ->
+      send_tcp_message(Socket, EncodedMessage);
+    {true, EncodedMessage, _TsigMac, _Message} ->
+      send_tcp_message(Socket, EncodedMessage)
+  end.
 
 send_tcp_message(Socket, EncodedMessage) ->
   BinLength = byte_size(EncodedMessage),
@@ -72,31 +99,41 @@ send_tcp_message(Socket, EncodedMessage) ->
   gen_tcp:send(Socket, TcpEncodedMessage).
 
 
-%% Handle DNS query that comes in over UDP
+%% @doc Handle DNS query that comes in over UDP
+-spec handle_udp_dns_query(gen_udp:socket(), gen_udp:ip(), inet:port_number(), binary()) -> ok.
 handle_udp_dns_query(Socket, Host, Port, Bin) ->
   %lager:debug("handle_udp_dns_query(~p ~p ~p)", [Socket, Host, Port]),
-  %% TODO: measure
+  erldns_events:notify({start_udp, [{host, Host}]}),
   case dns:decode_message(Bin) of
-    {truncated, _} -> 
-      %lager:debug("received bad request from ~p", [Host]);
-      ok;
-    {formerr, _, _} -> 
-      %lager:debug("formerr bad request from ~p", [Host]);
+    {trailing_garbage, DecodedMessage, _} ->
+      handle_decoded_udp_message(DecodedMessage, Socket, Host, Port);
+    {_Error, _, _} ->
       ok;
     DecodedMessage ->
-      Response = erldns_metrics:measure(udp, erldns_handler, handle, [DecodedMessage, Host]),
-      case erldns_encoder:encode_message(Response, [{'max_size', max_payload_size(Response)}]) of
-        {false, EncodedMessage} -> gen_udp:send(Socket, Host, Port, EncodedMessage);
-        {true, EncodedMessage, Message} when is_record(Message, dns_message)->
-          %lager:debug("Leftover: ~p", [Message]),
-          gen_udp:send(Socket, Host, Port, EncodedMessage);
-        {false, EncodedMessage, _TsigMac} ->
-          %lager:debug("TSIG mac: ~p", [TsigMac]),
-          gen_udp:send(Socket, Host, Port, EncodedMessage);
-        {true, EncodedMessage, _TsigMac, _Message} ->
-          %lager:debug("TSIG mac: ~p; Leftover: ~p", [TsigMac, Message]),
-          gen_udp:send(Socket, Host, Port, EncodedMessage)
-      end
+      handle_decoded_udp_message(DecodedMessage, Socket, Host, Port)
+  end,
+  erldns_events:notify({end_udp, [{host, Host}]}),
+  ok.
+
+-spec handle_decoded_udp_message(dns:message(), gen_udp:socket(), gen_udp:ip(), inet:port_number()) ->
+  ok | {error, not_owner | inet:posix()}.
+handle_decoded_udp_message(DecodedMessage, Socket, Host, Port) ->
+  Response = erldns_handler:handle(DecodedMessage, {udp, Host}),
+  DestHost = case ?REDIRECT_TO_LOOPBACK of
+    true -> ?LOOPBACK_DEST;
+    _ -> Host
+  end,
+
+  case erldns_encoder:encode_message(Response, [{'max_size', max_payload_size(Response)}]) of
+    {false, EncodedMessage} ->
+      %lager:debug("Sending encoded response to ~p", [DestHost]),
+      gen_udp:send(Socket, DestHost, Port, EncodedMessage);
+    {true, EncodedMessage, Message} when is_record(Message, dns_message)->
+      gen_udp:send(Socket, DestHost, Port, EncodedMessage);
+    {false, EncodedMessage, _TsigMac} ->
+      gen_udp:send(Socket, DestHost, Port, EncodedMessage);
+    {true, EncodedMessage, _TsigMac, _Message} ->
+      gen_udp:send(Socket, DestHost, Port, EncodedMessage)
   end.
 
 %% Determine the max payload size by looking for additional

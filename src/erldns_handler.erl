@@ -1,10 +1,30 @@
+%% Copyright (c) 2012-2013, Aetrion LLC
+%%
+%% Permission to use, copy, modify, and/or distribute this software for any
+%% purpose with or without fee is hereby granted, provided that the above
+%% copyright notice and this permission notice appear in all copies.
+%%
+%% THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+%% WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+%% MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+%% ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+%% WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+%% ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+%% OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+%% @doc The module that handles the resolution of a single DNS question.
+%%
+%% The meat of the resolution occurs in erldns_resolver:resolve/3
 -module(erldns_handler).
+
 -behavior(gen_server).
 
--include("dns.hrl").
+-include_lib("dns/include/dns.hrl").
 -include("erldns.hrl").
 
 -export([start_link/0, register_handler/2, get_handlers/0, handle/2]).
+
+-export([do_handle/2]).
 
 % Gen server hooks
 -export([init/1,
@@ -20,14 +40,23 @@
 
 -record(state, {handlers}).
 
+%% @doc Start the handler registry process.
+-spec start_link() -> any().
 start_link() ->
   gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
+%% @doc Register a record handler.
+-spec register_handler([dns:type()], module()) -> ok.
 register_handler(RecordTypes, Module) ->
   gen_server:call(?MODULE, {register_handler, RecordTypes, Module}).
 
+%% @doc Get all registered handlers along with the DNS types they handle.
+-spec get_handlers() -> [{module(), [dns:type()]}].
 get_handlers() ->
   gen_server:call(?MODULE, {get_handlers}).
+
+
+% gen_server callbacks
 
 init([]) ->
   %lager:info("Initialized the handler_registry"),
@@ -51,55 +80,81 @@ code_change(_PreviousVersion, State, _Extra) ->
 
 %% If the message has trailing garbage just throw the garbage away and continue
 %% trying to process the message.
-handle({trailing_garbage, Message, _}, Host) ->
-  handle(Message, Host);
+handle({trailing_garbage, Message, _}, Context) ->
+  handle(Message, Context);
 %% Handle the message, checking to see if it is throttled.
-handle(Message, Host) when is_record(Message, dns_message) ->
-  handle(Message, Host, erldns_query_throttle:throttle(Message, Host));
+handle(Message, Context = {_, Host}) when is_record(Message, dns_message) ->
+  handle(Message, Host, erldns_query_throttle:throttle(Message, Context));
 %% The message was bad so just return it.
 %% TODO: consider just throwing away the message
-handle(BadMessage, Host) ->
+handle(BadMessage, {_, Host}) ->
   lager:error("Received a bad message: ~p from ~p", [BadMessage, Host]),
   BadMessage.
 
 %% We throttle ANY queries to discourage use of our authoritative name servers
 %% for reflection attacks.
+%%
+%% Note: this should probably be changed to return the original packet without
+%% any answer data and with TC bit set to 1.
 handle(Message, Host, {throttled, Host, _ReqCount}) ->
-  %lager:debug("Throttled ANY query for ~p. (req count: ~p)", [Host, ReqCount]),
-  Message#dns_message{rc = ?DNS_RCODE_REFUSED};
+  folsom_metrics:notify({request_throttled_counter, {inc, 1}}),
+  folsom_metrics:notify({request_throttled_meter, 1}),
+  Message#dns_message{tc = true, aa = true, rc = ?DNS_RCODE_NOERROR};
+
 %% Message was not throttled, so handle it, then do EDNS handling, optionally
 %% append the SOA record if it is a zone transfer and complete the response
 %% by filling out count-related header fields.
 handle(Message, Host, _) ->
   %lager:debug("Questions: ~p", [Message#dns_message.questions]),
+  erldns_events:notify({start_handle, [{host, Host}, {message, Message}]}),
+  Response = folsom_metrics:histogram_timed_update(request_handled_histogram, ?MODULE, do_handle, [Message, Host]),
+  erldns_events:notify({end_handle, [{host, Host}, {message, Message}, {response, Response}]}),
+  Response.
+
+do_handle(Message, Host) ->
   NewMessage = handle_message(Message, Host),
   complete_response(erldns_axfr:optionally_append_soa(erldns_edns:handle(NewMessage))).
 
 %% Handle the message by hitting the packet cache and either
 %% using the cached packet or continuing with the lookup process.
+%%
+%% If the cache is missed, then the SOA (Start of Authority) is discovered here.
 handle_message(Message, Host) ->
   case erldns_packet_cache:get(Message#dns_message.questions, Host) of
-    {ok, CachedResponse} -> CachedResponse#dns_message{id=Message#dns_message.id};
-    {error, _} -> handle_packet_cache_miss(Message, get_authority(Message), Host) % SOA lookup
+    {ok, CachedResponse} ->
+      erldns_events:notify({packet_cache_hit, [{host, Host}, {message, Message}]}),
+      CachedResponse#dns_message{id=Message#dns_message.id};
+    {error, Reason} ->
+      erldns_events:notify({packet_cache_miss, [{reason, Reason}, {host, Host}, {message, Message}]}),
+      handle_packet_cache_miss(Message, get_authority(Message), Host) % SOA lookup
   end.
 
-%% If the packet is not in the cache and we are not authoritative, then answer
-%% immediately with the root delegation hints.
+%% If the packet is not in the cache and we are not authoritative (because there
+%% is no SOA record for this zone), then answer immediately setting the AA flag to false.
+%% If erldns is configured to use root hints then those will be added to the response.
 handle_packet_cache_miss(Message, [], _Host) ->
-  {Authority, Additional} = erldns_records:root_hints(),
-  Message#dns_message{aa = false, rc = ?DNS_RCODE_NOERROR, authority = Authority, additional = Additional};
+  case erldns_config:use_root_hints() of
+      true ->
+        {Authority, Additional} = erldns_records:root_hints(),
+        Message#dns_message{aa = false, rc = ?DNS_RCODE_NOERROR, authority = Authority, additional = Additional};
+      _ ->
+        Message#dns_message{aa = false, rc = ?DNS_RCODE_NOERROR}
+  end;
 
 %% The packet is not in the cache yet we are authoritative, so try to resolve
-%% the request.
+%% the request. This is the point the request moves on to the erldns_resolver
+%% module.
 handle_packet_cache_miss(Message, AuthorityRecords, Host) ->
-  handle_packet_cache_miss(Message#dns_message{ra = false}, AuthorityRecords, Host, Message#dns_message.aa).
+  safe_handle_packet_cache_miss(Message#dns_message{ra = false}, AuthorityRecords, Host).
 
-handle_packet_cache_miss(Message, AuthorityRecords, Host, Authoritative) ->
+safe_handle_packet_cache_miss(Message, AuthorityRecords, Host) ->
   case application:get_env(erldns, catch_exceptions) of
-    {ok, false} -> maybe_cache_packet(erldns_resolver:resolve(Message, AuthorityRecords, Host), Authoritative);
+    {ok, false} ->
+      Response = erldns_resolver:resolve(Message, AuthorityRecords, Host),
+      maybe_cache_packet(Response, Response#dns_message.aa);
     _ ->
       try erldns_resolver:resolve(Message, AuthorityRecords, Host) of
-        Response -> maybe_cache_packet(Response, Authoritative)
+        Response -> maybe_cache_packet(Response, Response#dns_message.aa)
       catch
         Exception:Reason ->
           lager:error("Error answering request: ~p (~p)", [Exception, Reason]),
